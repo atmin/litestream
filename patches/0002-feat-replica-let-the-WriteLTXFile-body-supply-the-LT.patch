@@ -1,0 +1,366 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Atanas Minev <atmin@protonmail.com>
+Date: Thu, 30 Jul 2026 20:35:06 +0300
+Subject: [PATCH] feat(replica): let the WriteLTXFile body supply the LTX
+ timestamp
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every backend records the LTX header's timestamp as object metadata (it is
+what timestamp-based restore and retention read back) and obtains it by
+teeing the upload stream through ltx.PeekHeader. That makes the body a
+*readable LTX stream* an unavoidable requirement, so a caller that
+transforms the bytes on the way out — encrypting or compressing them —
+cannot use WriteLTXFile at all: the write fails with "extract timestamp
+from LTX header".
+
+Add an optional LTXTimestamper interface on the body. When the reader
+implements it, the backend takes the timestamp from the caller and uploads
+the bytes verbatim; otherwise it peeks exactly as before. Every caller in
+this repository passes an *os.File, an io.PipeReader or a bytes.Reader,
+none of which implement it, so every existing path is unchanged.
+
+Applied to the s3 and file backends (the two s3lite uses). The remaining
+backends keep the peek path and can adopt the same three lines when needed.
+---
+ file/replica_client.go      |  30 +++++----
+ file/replica_client_test.go |  76 +++++++++++++++++++++++
+ replica_client.go           |  17 +++++
+ s3/replica_client.go        |  31 ++++++----
+ s3/replica_client_test.go   | 120 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 252 insertions(+), 22 deletions(-)
+
+diff --git a/file/replica_client.go b/file/replica_client.go
+index 31c21f3..7a1da0f 100644
+--- a/file/replica_client.go
++++ b/file/replica_client.go
+@@ -160,19 +160,27 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
+ 		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
+ 	}
+ 
+-	// Use TeeReader to peek at LTX header while preserving data for upload
+-	var buf bytes.Buffer
+-	teeReader := io.TeeReader(rd, &buf)
++	var timestamp time.Time
++	var fullReader io.Reader = rd
++	if ts, ok := rd.(litestream.LTXTimestamper); ok {
++		// The body is not a readable LTX stream (it transforms the bytes on the
++		// way out) and supplies the header timestamp itself. See LTXTimestamper.
++		timestamp = ts.LTXTimestamp().UTC()
++	} else {
++		// Use TeeReader to peek at LTX header while preserving data for upload
++		var buf bytes.Buffer
++		teeReader := io.TeeReader(rd, &buf)
++
++		// Extract timestamp from LTX header
++		hdr, _, err := ltx.PeekHeader(teeReader)
++		if err != nil {
++			return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
++		}
++		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
+ 
+-	// Extract timestamp from LTX header
+-	hdr, _, err := ltx.PeekHeader(teeReader)
+-	if err != nil {
+-		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
++		// Combine buffered data with rest of reader
++		fullReader = io.MultiReader(&buf, rd)
+ 	}
+-	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+-
+-	// Combine buffered data with rest of reader
+-	fullReader := io.MultiReader(&buf, rd)
+ 
+ 	// Ensure parent directory exists.
+ 	filename := c.LTXFilePath(level, minTXID, maxTXID)
+diff --git a/file/replica_client_test.go b/file/replica_client_test.go
+index c1dfda7..f5ccc6e 100644
+--- a/file/replica_client_test.go
++++ b/file/replica_client_test.go
+@@ -819,3 +819,79 @@ func TestReplicaClient_OpenLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// stampedReader is a body that is not a readable LTX stream and supplies the LTX
++// header timestamp itself (litestream.LTXTimestamper) — the shape an encrypting
++// or compressing caller has.
++type stampedReader struct {
++	io.Reader
++	ts time.Time
++}
++
++func (r *stampedReader) LTXTimestamp() time.Time { return r.ts }
++
++// TestReplicaClient_WriteLTXFile_LTXTimestamp pins the caller-supplied-timestamp
++// hook: a body implementing litestream.LTXTimestamper is uploaded verbatim (never
++// peeked, so it need not be valid LTX) and its timestamp becomes the file's
++// CreatedAt and ModTime.
++func TestReplicaClient_WriteLTXFile_LTXTimestamp(t *testing.T) {
++	// Truncated to milliseconds: that is the resolution an LTX header carries.
++	want := time.UnixMilli(time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC).UnixMilli()).UTC()
++
++	t.Run("SuppliedByBody", func(t *testing.T) {
++		dir := t.TempDir()
++		c := file.NewReplicaClient(dir)
++
++		// Deliberately not an LTX file: the peek path would reject this.
++		payload := []byte("not-an-ltx-stream, just opaque bytes")
++		rd := &stampedReader{Reader: bytes.NewReader(payload), ts: want}
++
++		info, err := c.WriteLTXFile(context.Background(), 0, 1, 2, rd)
++		if err != nil {
++			t.Fatalf("WriteLTXFile: %v", err)
++		}
++		if !info.CreatedAt.Equal(want) {
++			t.Fatalf("CreatedAt=%v, want %v", info.CreatedAt, want)
++		}
++		if got := int64(len(payload)); info.Size != got {
++			t.Fatalf("Size=%d, want %d", info.Size, got)
++		}
++
++		// The body must reach disk byte-for-byte.
++		got, err := os.ReadFile(c.LTXFilePath(0, 1, 2))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !bytes.Equal(got, payload) {
++			t.Fatalf("stored body=%q, want %q", got, payload)
++		}
++
++		fi, err := os.Stat(c.LTXFilePath(0, 1, 2))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !fi.ModTime().Equal(want) {
++			t.Fatalf("ModTime=%v, want %v", fi.ModTime(), want)
++		}
++	})
++
++	// The hook is additive: a plain reader keeps taking the peek path, so a body
++	// that is not valid LTX and does not supply a timestamp still fails.
++	t.Run("PlainReaderStillPeeks", func(t *testing.T) {
++		dir := t.TempDir()
++		c := file.NewReplicaClient(dir)
++
++		data := createLTXHeader(1, 2)
++		info, err := c.WriteLTXFile(context.Background(), 0, 1, 2, bytes.NewReader(data))
++		if err != nil {
++			t.Fatalf("WriteLTXFile: %v", err)
++		}
++		if info.CreatedAt.IsZero() {
++			t.Fatal("CreatedAt should come from the peeked LTX header")
++		}
++
++		if _, err := c.WriteLTXFile(context.Background(), 0, 3, 4, bytes.NewReader([]byte("garbage"))); err == nil {
++			t.Fatal("a non-LTX plain reader must still fail the header peek")
++		}
++	})
++}
+diff --git a/replica_client.go b/replica_client.go
+index e2c07b0..4278104 100644
+--- a/replica_client.go
++++ b/replica_client.go
+@@ -9,12 +9,29 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
++	"time"
+ 
+ 	"github.com/superfly/ltx"
+ )
+ 
+ var ErrStopIter = errors.New("stop iterator")
+ 
++// LTXTimestamper is an optional interface for the io.Reader passed to
++// ReplicaClient.WriteLTXFile. Backends record the LTX header's timestamp as
++// object metadata (it is what timestamp-based restore and retention read back),
++// and normally obtain it by peeking the header out of the upload stream. A body
++// that is not a readable LTX stream — a caller that transforms the bytes on the
++// way out, e.g. by encrypting or compressing them — cannot be peeked, so it may
++// instead supply the timestamp directly by implementing this interface.
++//
++// It is purely additive: a reader that does not implement it (an *os.File, an
++// io.PipeReader, a bytes.Reader — every caller in this repository) takes the
++// unchanged peek path.
++type LTXTimestamper interface {
++	// LTXTimestamp returns the timestamp of the LTX header this body carries.
++	LTXTimestamp() time.Time
++}
++
+ // ReplicaClient represents client to connect to a Replica.
+ type ReplicaClient interface {
+ 	// Type returns the type of client.
+diff --git a/s3/replica_client.go b/s3/replica_client.go
+index 31500e6..0d56497 100644
+--- a/s3/replica_client.go
++++ b/s3/replica_client.go
+@@ -685,19 +685,28 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
+ 		return nil, err
+ 	}
+ 
+-	// Use TeeReader to peek at LTX header while preserving data for upload
+-	var buf bytes.Buffer
+-	teeReader := io.TeeReader(r, &buf)
++	var timestamp time.Time
++	var body io.Reader = r
++	if ts, ok := r.(litestream.LTXTimestamper); ok {
++		// The body is not a readable LTX stream (it transforms the bytes on the
++		// way out) and supplies the header timestamp itself. See LTXTimestamper.
++		timestamp = ts.LTXTimestamp().UTC()
++	} else {
++		// Use TeeReader to peek at LTX header while preserving data for upload
++		var buf bytes.Buffer
++		teeReader := io.TeeReader(r, &buf)
+ 
+-	// Extract timestamp from LTX header
+-	hdr, _, err := ltx.PeekHeader(teeReader)
+-	if err != nil {
+-		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+-	}
+-	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
++		// Extract timestamp from LTX header
++		hdr, _, err := ltx.PeekHeader(teeReader)
++		if err != nil {
++			return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
++		}
++		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
+ 
+-	// Combine buffered data with rest of reader
+-	rc := internal.NewReadCounter(io.MultiReader(&buf, r))
++		// Combine buffered data with rest of reader
++		body = io.MultiReader(&buf, r)
++	}
++	rc := internal.NewReadCounter(body)
+ 
+ 	filename := ltx.FormatFilename(minTXID, maxTXID)
+ 	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
+diff --git a/s3/replica_client_test.go b/s3/replica_client_test.go
+index ded6c95..3b978b5 100644
+--- a/s3/replica_client_test.go
++++ b/s3/replica_client_test.go
+@@ -2212,3 +2212,123 @@ func TestReplicaClient_RetryerSurvivesSustainedFailures(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// stampedReader is a body that is not a readable LTX stream and supplies the LTX
++// header timestamp itself (litestream.LTXTimestamper) — the shape an encrypting
++// or compressing caller has.
++type stampedReader struct {
++	io.Reader
++	ts time.Time
++}
++
++func (r *stampedReader) LTXTimestamp() time.Time { return r.ts }
++
++// TestReplicaClient_WriteLTXFile_LTXTimestamp pins the caller-supplied-timestamp
++// hook: a body implementing litestream.LTXTimestamper is uploaded verbatim (never
++// peeked, so it need not be valid LTX) and its timestamp is what lands in the
++// litestream-timestamp object metadata.
++func TestReplicaClient_WriteLTXFile_LTXTimestamp(t *testing.T) {
++	want := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
++
++	newServer := func(t *testing.T, headers chan<- http.Header, bodies chan<- []byte) *httptest.Server {
++		t.Helper()
++		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			defer r.Body.Close()
++			body, _ := io.ReadAll(r.Body)
++
++			if r.Method == http.MethodPut {
++				select {
++				case headers <- r.Header.Clone():
++				default:
++				}
++				select {
++				case bodies <- body:
++				default:
++				}
++				w.Header().Set("ETag", `"test-etag"`)
++				w.WriteHeader(http.StatusOK)
++				return
++			}
++			w.WriteHeader(http.StatusOK)
++		}))
++	}
++
++	newClient := func(t *testing.T, endpoint string) *ReplicaClient {
++		t.Helper()
++		c := NewReplicaClient()
++		c.Bucket = "test-bucket"
++		c.Path = "replica"
++		c.Region = "us-east-1"
++		c.Endpoint = endpoint
++		c.ForcePathStyle = true
++		c.AccessKeyID = "test-access-key"
++		c.SecretAccessKey = "test-secret-key"
++		if err := c.Init(context.Background()); err != nil {
++			t.Fatalf("Init: %v", err)
++		}
++		return c
++	}
++
++	t.Run("SuppliedByBody", func(t *testing.T) {
++		headers := make(chan http.Header, 1)
++		bodies := make(chan []byte, 1)
++		server := newServer(t, headers, bodies)
++		defer server.Close()
++
++		c := newClient(t, server.URL)
++
++		// Deliberately not an LTX file: the peek path would reject this.
++		payload := []byte("not-an-ltx-stream, just opaque bytes")
++		rd := &stampedReader{Reader: bytes.NewReader(payload), ts: want}
++
++		info, err := c.WriteLTXFile(context.Background(), 0, 1, 2, rd)
++		if err != nil {
++			t.Fatalf("WriteLTXFile: %v", err)
++		}
++		if !info.CreatedAt.Equal(want) {
++			t.Fatalf("CreatedAt=%v, want %v", info.CreatedAt, want)
++		}
++		if got := int64(len(payload)); info.Size != got {
++			t.Fatalf("Size=%d, want %d", info.Size, got)
++		}
++
++		select {
++		case hdr := <-headers:
++			got := hdr.Get("x-amz-meta-" + MetadataKeyTimestamp)
++			if parsed, err := time.Parse(time.RFC3339Nano, got); err != nil {
++				t.Fatalf("metadata timestamp %q: %v", got, err)
++			} else if !parsed.Equal(want) {
++				t.Fatalf("metadata timestamp=%v, want %v", parsed, want)
++			}
++		case <-time.After(5 * time.Second):
++			t.Fatal("timeout waiting for PUT request")
++		}
++
++		select {
++		case body := <-bodies:
++			if !bytes.Equal(body, payload) {
++				t.Fatalf("uploaded body=%q, want %q", body, payload)
++			}
++		default:
++			t.Fatal("no body captured")
++		}
++	})
++
++	// The hook is additive: a plain reader keeps taking the peek path, so a body
++	// that is not valid LTX and does not supply a timestamp still fails.
++	t.Run("PlainReaderStillPeeks", func(t *testing.T) {
++		headers := make(chan http.Header, 1)
++		bodies := make(chan []byte, 1)
++		server := newServer(t, headers, bodies)
++		defer server.Close()
++
++		c := newClient(t, server.URL)
++
++		if _, err := c.WriteLTXFile(context.Background(), 0, 1, 2, bytes.NewReader(mustLTX(t))); err != nil {
++			t.Fatalf("WriteLTXFile: %v", err)
++		}
++		if _, err := c.WriteLTXFile(context.Background(), 0, 3, 4, bytes.NewReader([]byte("garbage"))); err == nil {
++			t.Fatal("a non-LTX plain reader must still fail the header peek")
++		}
++	})
++}
