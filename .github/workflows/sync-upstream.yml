@@ -5,9 +5,12 @@
 # so carrying it must cost nothing. The only manual case is a rebase conflict —
 # which is exactly the case that deserves human eyes — and that opens an issue.
 #
-# NOTE: GitHub fires `schedule` only from a repository's *default* branch. For the
-# weekly run to happen, this fork's default branch must be `s3lite`. Until then,
-# `workflow_dispatch` (and the hand-run commands in LITESTREAM-FORK.md) still work.
+# NOTE: GitHub fires `schedule` only from a repository's *default* branch, which is why
+# this fork's default branch is `s3lite` and not `main`. Two ways the weekly run stops
+# silently: re-pointing the default branch, and GitHub disabling a schedule after 60
+# days without repository activity (this sync only commits when upstream cuts a release,
+# so a quiet upstream can trip it — re-enable in the Actions tab). `workflow_dispatch`
+# and the hand-run commands in s3lite's LITESTREAM-FORK.md always work.
 name: sync-upstream
 
 on:
