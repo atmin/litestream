@@ -160,19 +160,27 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
 	}
 
-	// Use TeeReader to peek at LTX header while preserving data for upload
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(rd, &buf)
+	var timestamp time.Time
+	var fullReader io.Reader = rd
+	if ts, ok := rd.(litestream.LTXTimestamper); ok {
+		// The body is not a readable LTX stream (it transforms the bytes on the
+		// way out) and supplies the header timestamp itself. See LTXTimestamper.
+		timestamp = ts.LTXTimestamp().UTC()
+	} else {
+		// Use TeeReader to peek at LTX header while preserving data for upload
+		var buf bytes.Buffer
+		teeReader := io.TeeReader(rd, &buf)
 
-	// Extract timestamp from LTX header
-	hdr, _, err := ltx.PeekHeader(teeReader)
-	if err != nil {
-		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+		// Extract timestamp from LTX header
+		hdr, _, err := ltx.PeekHeader(teeReader)
+		if err != nil {
+			return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+		}
+		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
+
+		// Combine buffered data with rest of reader
+		fullReader = io.MultiReader(&buf, rd)
 	}
-	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
-
-	// Combine buffered data with rest of reader
-	fullReader := io.MultiReader(&buf, rd)
 
 	// Ensure parent directory exists.
 	filename := c.LTXFilePath(level, minTXID, maxTXID)

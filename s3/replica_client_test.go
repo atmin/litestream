@@ -2212,3 +2212,123 @@ func TestReplicaClient_RetryerSurvivesSustainedFailures(t *testing.T) {
 		}
 	}
 }
+
+// stampedReader is a body that is not a readable LTX stream and supplies the LTX
+// header timestamp itself (litestream.LTXTimestamper) — the shape an encrypting
+// or compressing caller has.
+type stampedReader struct {
+	io.Reader
+	ts time.Time
+}
+
+func (r *stampedReader) LTXTimestamp() time.Time { return r.ts }
+
+// TestReplicaClient_WriteLTXFile_LTXTimestamp pins the caller-supplied-timestamp
+// hook: a body implementing litestream.LTXTimestamper is uploaded verbatim (never
+// peeked, so it need not be valid LTX) and its timestamp is what lands in the
+// litestream-timestamp object metadata.
+func TestReplicaClient_WriteLTXFile_LTXTimestamp(t *testing.T) {
+	want := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	newServer := func(t *testing.T, headers chan<- http.Header, bodies chan<- []byte) *httptest.Server {
+		t.Helper()
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer r.Body.Close()
+			body, _ := io.ReadAll(r.Body)
+
+			if r.Method == http.MethodPut {
+				select {
+				case headers <- r.Header.Clone():
+				default:
+				}
+				select {
+				case bodies <- body:
+				default:
+				}
+				w.Header().Set("ETag", `"test-etag"`)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+	}
+
+	newClient := func(t *testing.T, endpoint string) *ReplicaClient {
+		t.Helper()
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Path = "replica"
+		c.Region = "us-east-1"
+		c.Endpoint = endpoint
+		c.ForcePathStyle = true
+		c.AccessKeyID = "test-access-key"
+		c.SecretAccessKey = "test-secret-key"
+		if err := c.Init(context.Background()); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+		return c
+	}
+
+	t.Run("SuppliedByBody", func(t *testing.T) {
+		headers := make(chan http.Header, 1)
+		bodies := make(chan []byte, 1)
+		server := newServer(t, headers, bodies)
+		defer server.Close()
+
+		c := newClient(t, server.URL)
+
+		// Deliberately not an LTX file: the peek path would reject this.
+		payload := []byte("not-an-ltx-stream, just opaque bytes")
+		rd := &stampedReader{Reader: bytes.NewReader(payload), ts: want}
+
+		info, err := c.WriteLTXFile(context.Background(), 0, 1, 2, rd)
+		if err != nil {
+			t.Fatalf("WriteLTXFile: %v", err)
+		}
+		if !info.CreatedAt.Equal(want) {
+			t.Fatalf("CreatedAt=%v, want %v", info.CreatedAt, want)
+		}
+		if got := int64(len(payload)); info.Size != got {
+			t.Fatalf("Size=%d, want %d", info.Size, got)
+		}
+
+		select {
+		case hdr := <-headers:
+			got := hdr.Get("x-amz-meta-" + MetadataKeyTimestamp)
+			if parsed, err := time.Parse(time.RFC3339Nano, got); err != nil {
+				t.Fatalf("metadata timestamp %q: %v", got, err)
+			} else if !parsed.Equal(want) {
+				t.Fatalf("metadata timestamp=%v, want %v", parsed, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for PUT request")
+		}
+
+		select {
+		case body := <-bodies:
+			if !bytes.Equal(body, payload) {
+				t.Fatalf("uploaded body=%q, want %q", body, payload)
+			}
+		default:
+			t.Fatal("no body captured")
+		}
+	})
+
+	// The hook is additive: a plain reader keeps taking the peek path, so a body
+	// that is not valid LTX and does not supply a timestamp still fails.
+	t.Run("PlainReaderStillPeeks", func(t *testing.T) {
+		headers := make(chan http.Header, 1)
+		bodies := make(chan []byte, 1)
+		server := newServer(t, headers, bodies)
+		defer server.Close()
+
+		c := newClient(t, server.URL)
+
+		if _, err := c.WriteLTXFile(context.Background(), 0, 1, 2, bytes.NewReader(mustLTX(t))); err != nil {
+			t.Fatalf("WriteLTXFile: %v", err)
+		}
+		if _, err := c.WriteLTXFile(context.Background(), 0, 3, 4, bytes.NewReader([]byte("garbage"))); err == nil {
+			t.Fatal("a non-LTX plain reader must still fail the header peek")
+		}
+	})
+}

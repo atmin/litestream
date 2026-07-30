@@ -819,3 +819,79 @@ func TestReplicaClient_OpenLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
 		}
 	})
 }
+
+// stampedReader is a body that is not a readable LTX stream and supplies the LTX
+// header timestamp itself (litestream.LTXTimestamper) — the shape an encrypting
+// or compressing caller has.
+type stampedReader struct {
+	io.Reader
+	ts time.Time
+}
+
+func (r *stampedReader) LTXTimestamp() time.Time { return r.ts }
+
+// TestReplicaClient_WriteLTXFile_LTXTimestamp pins the caller-supplied-timestamp
+// hook: a body implementing litestream.LTXTimestamper is uploaded verbatim (never
+// peeked, so it need not be valid LTX) and its timestamp becomes the file's
+// CreatedAt and ModTime.
+func TestReplicaClient_WriteLTXFile_LTXTimestamp(t *testing.T) {
+	// Truncated to milliseconds: that is the resolution an LTX header carries.
+	want := time.UnixMilli(time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC).UnixMilli()).UTC()
+
+	t.Run("SuppliedByBody", func(t *testing.T) {
+		dir := t.TempDir()
+		c := file.NewReplicaClient(dir)
+
+		// Deliberately not an LTX file: the peek path would reject this.
+		payload := []byte("not-an-ltx-stream, just opaque bytes")
+		rd := &stampedReader{Reader: bytes.NewReader(payload), ts: want}
+
+		info, err := c.WriteLTXFile(context.Background(), 0, 1, 2, rd)
+		if err != nil {
+			t.Fatalf("WriteLTXFile: %v", err)
+		}
+		if !info.CreatedAt.Equal(want) {
+			t.Fatalf("CreatedAt=%v, want %v", info.CreatedAt, want)
+		}
+		if got := int64(len(payload)); info.Size != got {
+			t.Fatalf("Size=%d, want %d", info.Size, got)
+		}
+
+		// The body must reach disk byte-for-byte.
+		got, err := os.ReadFile(c.LTXFilePath(0, 1, 2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("stored body=%q, want %q", got, payload)
+		}
+
+		fi, err := os.Stat(c.LTXFilePath(0, 1, 2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fi.ModTime().Equal(want) {
+			t.Fatalf("ModTime=%v, want %v", fi.ModTime(), want)
+		}
+	})
+
+	// The hook is additive: a plain reader keeps taking the peek path, so a body
+	// that is not valid LTX and does not supply a timestamp still fails.
+	t.Run("PlainReaderStillPeeks", func(t *testing.T) {
+		dir := t.TempDir()
+		c := file.NewReplicaClient(dir)
+
+		data := createLTXHeader(1, 2)
+		info, err := c.WriteLTXFile(context.Background(), 0, 1, 2, bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("WriteLTXFile: %v", err)
+		}
+		if info.CreatedAt.IsZero() {
+			t.Fatal("CreatedAt should come from the peeked LTX header")
+		}
+
+		if _, err := c.WriteLTXFile(context.Background(), 0, 3, 4, bytes.NewReader([]byte("garbage"))); err == nil {
+			t.Fatal("a non-LTX plain reader must still fail the header peek")
+		}
+	})
+}

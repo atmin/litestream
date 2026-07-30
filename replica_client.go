@@ -9,11 +9,28 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/superfly/ltx"
 )
 
 var ErrStopIter = errors.New("stop iterator")
+
+// LTXTimestamper is an optional interface for the io.Reader passed to
+// ReplicaClient.WriteLTXFile. Backends record the LTX header's timestamp as
+// object metadata (it is what timestamp-based restore and retention read back),
+// and normally obtain it by peeking the header out of the upload stream. A body
+// that is not a readable LTX stream — a caller that transforms the bytes on the
+// way out, e.g. by encrypting or compressing them — cannot be peeked, so it may
+// instead supply the timestamp directly by implementing this interface.
+//
+// It is purely additive: a reader that does not implement it (an *os.File, an
+// io.PipeReader, a bytes.Reader — every caller in this repository) takes the
+// unchanged peek path.
+type LTXTimestamper interface {
+	// LTXTimestamp returns the timestamp of the LTX header this body carries.
+	LTXTimestamp() time.Time
+}
 
 // ReplicaClient represents client to connect to a Replica.
 type ReplicaClient interface {
