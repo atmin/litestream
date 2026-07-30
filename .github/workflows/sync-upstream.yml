@@ -1,0 +1,200 @@
+# Rebase the carried s3lite patches onto each new upstream litestream release,
+# cut the next immutable tag, and tell s3lite to open a pin-bump PR.
+#
+# The fork is permanent infrastructure (see s3lite's LITESTREAM-FORK.md ledger),
+# so carrying it must cost nothing. The only manual case is a rebase conflict —
+# which is exactly the case that deserves human eyes — and that opens an issue.
+#
+# NOTE: GitHub fires `schedule` only from a repository's *default* branch. For the
+# weekly run to happen, this fork's default branch must be `s3lite`. Until then,
+# `workflow_dispatch` (and the hand-run commands in LITESTREAM-FORK.md) still work.
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the rebased branch and the new tag
+  issues: write # open the conflict issue
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/benbjohnson/litestream.git
+  BRANCH: s3lite
+  # Cross-repo repository_dispatch needs a PAT; GITHUB_TOKEN is repo-scoped.
+  # Omit the secret to skip the dispatch — the tag is still pushed.
+  DISPATCH_REPO: atmin/s3lite
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: s3lite
+          fetch-depth: 0 # full history + tags: the rebase needs both
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve the old and new bases
+        id: bases
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream --tags
+
+          # NEW: newest non-prerelease upstream release (vX.Y.Z exactly).
+          NEW=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V | tail -1)
+          # OLD: the base encoded in the newest tag we cut. The tag name carries
+          # it (v0.5.15-s3lite.2 sits on v0.5.15), so no state file is needed.
+          OLD=$(git tag --list '*-s3lite.*' | sort -V | tail -1 | sed 's/-s3lite\..*$//')
+
+          if [ -z "$NEW" ] || [ -z "$OLD" ]; then
+            echo "could not resolve bases (NEW='$NEW' OLD='$OLD')" >&2
+            exit 1
+          fi
+          echo "old=$OLD" >>"$GITHUB_OUTPUT"
+          echo "new=$NEW" >>"$GITHUB_OUTPUT"
+          if [ "$NEW" = "$OLD" ]; then
+            echo "already on the newest upstream release ($NEW); nothing to do."
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "rebasing $BRANCH from $OLD onto $NEW"
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase the carried patches
+        id: rebase
+        if: steps.bases.outputs.changed == 'true'
+        run: |
+          set -uo pipefail
+          git config user.name "s3lite-sync[bot]"
+          git config user.email "s3lite-sync@users.noreply.github.com"
+          if git rebase --onto "${{ steps.bases.outputs.new }}" \
+                        "${{ steps.bases.outputs.old }}" "$BRANCH"; then
+            echo "conflict=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Capture the conflict for the issue body, then leave the tree clean.
+          {
+            git --no-pager status --short || true
+            echo
+            git --no-pager diff --diff-filter=U || true
+          } >/tmp/conflict.txt
+          git rebase --abort || true
+          echo "conflict=true" >>"$GITHUB_OUTPUT"
+
+      - name: Open a conflict issue and stop
+        if: steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Rebasing \`$BRANCH\` from \`${{ steps.bases.outputs.old }}\` onto"
+            echo "\`${{ steps.bases.outputs.new }}\` conflicts. A human needs to resolve it —"
+            echo "the one manual case in the sync."
+            echo
+            echo '```bash'
+            echo "git fetch upstream --tags"
+            echo "git rebase --onto ${{ steps.bases.outputs.new }} ${{ steps.bases.outputs.old }} $BRANCH"
+            echo "# resolve, then:"
+            echo "rm -f patches/*.patch"
+            echo "git format-patch ${{ steps.bases.outputs.new }}..$BRANCH -o patches --no-signature -N -- . ':(exclude)patches'"
+            echo "git commit -am 'chore: refresh patches/ after rebase'"
+            echo "git push --force-with-lease origin $BRANCH"
+            echo "git tag -a ${{ steps.bases.outputs.new }}-s3lite.1 -m 'litestream ${{ steps.bases.outputs.new }} + s3lite patches'"
+            echo "git push origin ${{ steps.bases.outputs.new }}-s3lite.1"
+            echo '```'
+            echo
+            echo "<details><summary>Conflict state</summary>"
+            echo
+            echo '```'
+            cat /tmp/conflict.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } >/tmp/issue.md
+          gh issue create \
+            --title "sync-upstream: rebase onto ${{ steps.bases.outputs.new }} conflicts" \
+            --body-file /tmp/issue.md
+          exit 1
+
+      - name: Verify each carried patch still does its job
+        if: steps.rebase.outputs.conflict == 'false'
+        run: |
+          set -euo pipefail
+          go build ./...
+          go vet ./...
+          # A -run filter that matches nothing still exits 0, so assert the
+          # ledger's tests exist before trusting that they passed: a patch
+          # silently dropped by the rebase must fail the sync, not pass it.
+          for t in \
+            "TestReplica_Restore_Follow_ResumeAheadOfSnapshot ." \
+            "TestReplicaClient_WriteLTXFile_LTXTimestamp ./s3" \
+            "TestReplicaClient_WriteLTXFile_LTXTimestamp ./file" ; do
+            set -- $t
+            if ! go test -list "^$1\$" "$2" | grep -qx "$1"; then
+              echo "carried patch regressed: $1 is gone from $2" >&2
+              exit 1
+            fi
+          done
+          go test -count=1 -run 'TestReplica_Restore_Follow|LTXTimestamp' . ./s3 ./file
+
+      - name: Refresh patches/, push the branch and cut the tag
+        id: publish
+        if: steps.rebase.outputs.conflict == 'false'
+        run: |
+          set -euo pipefail
+          NEW="${{ steps.bases.outputs.new }}"
+          TAG="$NEW-s3lite.1"
+          rm -f patches/*.patch
+          # Exclude patches/ itself (else each refresh rewrites the patch that
+          # carries the previous refresh) and zero the SHA in each header (else
+          # every rebase rewrites every patch even when no code changed). With
+          # both, a refresh is a real no-op unless a patch's content moved.
+          git format-patch "$NEW..$BRANCH" -o patches \
+            --no-signature -N --zero-commit -- . ':(exclude)patches'
+          if ! git diff --quiet -- patches; then
+            git add patches
+            # Keep the branch tidy: if the tip is already a patches-only refresh,
+            # amend it instead of stacking one such commit per sync.
+            if [ -z "$(git show --name-only --format= HEAD | grep -v '^patches/' || true)" ]; then
+              git commit -q --amend -m "chore(patches): refresh for base $NEW"
+            else
+              git commit -q -m "chore(patches): refresh for base $NEW"
+            fi
+          fi
+          git push --force-with-lease origin "$BRANCH"
+          git tag -a "$TAG" -m "litestream $NEW + the s3lite patch ledger"
+          git push origin "$TAG"
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+
+      - name: Ask s3lite to bump its pin
+        if: steps.rebase.outputs.conflict == 'false'
+        env:
+          # Cross-repo dispatch needs a PAT with `repo` scope on s3lite.
+          DISPATCH_TOKEN: ${{ secrets.S3LITE_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "S3LITE_DISPATCH_TOKEN not set; the tag is pushed, bump the pin by hand" \
+                 "(or run s3lite's litestream-pin workflow manually)."
+            exit 0
+          fi
+          curl -sSf -X POST \
+            -H "Authorization: Bearer $DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$DISPATCH_REPO/dispatches" \
+            -d "$(printf '{"event_type":"litestream-pin","client_payload":{"base":"%s","tag":"%s"}}' \
+                  "${{ steps.bases.outputs.new }}" "${{ steps.publish.outputs.tag }}")"
