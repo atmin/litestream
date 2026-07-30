@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   stale:
+    # Fork guard, as in release.yml: upstream's own automation runs only upstream.
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/stale@v9

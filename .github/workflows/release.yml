@@ -18,6 +18,11 @@ permissions:
 
 jobs:
   goreleaser:
+    # Fork guard: this fork cuts `vX.Y.Z-s3lite.N` tags off the `s3lite` branch, and a
+    # tag push matching `v*` would otherwise run upstream's goreleaser here. It fails
+    # (403 publishing a release to benbjohnson/litestream) and would be wrong if it
+    # ever succeeded — the fork publishes nothing but the tag itself.
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

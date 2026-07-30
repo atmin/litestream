@@ -26,6 +26,8 @@ env:
 jobs:
   race-detector-sweep:
     name: Race Detector Sweep
+    # Fork guard, as in release.yml: upstream's own automation runs only upstream.
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
