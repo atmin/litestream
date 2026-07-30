@@ -745,15 +745,22 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 		return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
 	}
 
-	// Extract timestamp from LTX header, then rewind so the upload sees the
-	// full file.
-	hdr, _, err := ltx.PeekHeader(rs)
-	if err != nil {
-		return 0, time.Time{}, nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
-	}
-	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
-	if _, err := rs.Seek(start, io.SeekStart); err != nil {
-		return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
+	var timestamp time.Time
+	if ts, ok := rs.(litestream.LTXTimestamper); ok {
+		// The body is not a readable LTX stream (it transforms the bytes on the
+		// way out) and supplies the header timestamp itself. See LTXTimestamper.
+		timestamp = ts.LTXTimestamp().UTC()
+	} else {
+		// Extract timestamp from LTX header, then rewind so the upload sees the
+		// full file.
+		hdr, _, err := ltx.PeekHeader(rs)
+		if err != nil {
+			return 0, time.Time{}, nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+		}
+		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
+		if _, err := rs.Seek(start, io.SeekStart); err != nil {
+			return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
+		}
 	}
 
 	input := c.putObjectInput(key, timestamp)
@@ -780,13 +787,20 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 // uploadStreamedLTX uploads from a reader of unknown size, buffering up to
 // the part size to determine whether the object fits in a single PutObject.
 func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
-	// Use TeeReader to peek at LTX header while preserving data for upload
 	var buf bytes.Buffer
-	hdr, _, err := ltx.PeekHeader(io.TeeReader(r, &buf))
-	if err != nil {
-		return 0, time.Time{}, nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	var timestamp time.Time
+	if ts, ok := r.(litestream.LTXTimestamper); ok {
+		// The body is not a readable LTX stream (it transforms the bytes on the
+		// way out) and supplies the header timestamp itself. See LTXTimestamper.
+		timestamp = ts.LTXTimestamp().UTC()
+	} else {
+		// Use TeeReader to peek at LTX header while preserving data for upload
+		hdr, _, err := ltx.PeekHeader(io.TeeReader(r, &buf))
+		if err != nil {
+			return 0, time.Time{}, nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+		}
+		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
 	}
-	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
 
 	if _, err := io.CopyN(&buf, r, partSize-int64(buf.Len())); err != nil && !errors.Is(err, io.EOF) {
 		return 0, time.Time{}, nil, fmt.Errorf("s3: buffer ltx stream %s: %w", key, err)
