@@ -112,9 +112,6 @@ jobs:
             echo "git fetch upstream --tags"
             echo "git rebase --onto ${{ steps.bases.outputs.new }} ${{ steps.bases.outputs.old }} $BRANCH"
             echo "# resolve, then:"
-            echo "rm -f patches/*.patch"
-            echo "git format-patch ${{ steps.bases.outputs.new }}..$BRANCH -o patches --no-signature -N -- . ':(exclude)patches'"
-            echo "git commit -am 'chore: refresh patches/ after rebase'"
             echo "git push --force-with-lease origin $BRANCH"
             echo "git tag -a ${{ steps.bases.outputs.new }}-s3lite.1 -m 'litestream ${{ steps.bases.outputs.new }} + s3lite patches'"
             echo "git push origin ${{ steps.bases.outputs.new }}-s3lite.1"
@@ -154,30 +151,16 @@ jobs:
           done
           go test -count=1 -run 'TestReplica_Restore_Follow|LTXTimestamp' . ./s3 ./file
 
-      - name: Refresh patches/, push the branch and cut the tag
+      - name: Push the branch and cut the tag
         id: publish
         if: steps.rebase.outputs.conflict == 'false'
         run: |
           set -euo pipefail
           NEW="${{ steps.bases.outputs.new }}"
           TAG="$NEW-s3lite.1"
-          rm -f patches/*.patch
-          # Exclude patches/ itself (else each refresh rewrites the patch that
-          # carries the previous refresh) and zero the SHA in each header (else
-          # every rebase rewrites every patch even when no code changed). With
-          # both, a refresh is a real no-op unless a patch's content moved.
-          git format-patch "$NEW..$BRANCH" -o patches \
-            --no-signature -N --zero-commit -- . ':(exclude)patches'
-          if ! git diff --quiet -- patches; then
-            git add patches
-            # Keep the branch tidy: if the tip is already a patches-only refresh,
-            # amend it instead of stacking one such commit per sync.
-            if [ -z "$(git show --name-only --format= HEAD | grep -v '^patches/' || true)" ]; then
-              git commit -q --amend -m "chore(patches): refresh for base $NEW"
-            else
-              git commit -q -m "chore(patches): refresh for base $NEW"
-            fi
-          fi
+          # The tag below is the series' recovery copy: immutable, and it carries
+          # every carried commit, so a lost or mis-pushed branch is one
+          # `git branch -f s3lite <newest tag>` away.
           git push --force-with-lease origin "$BRANCH"
           git tag -a "$TAG" -m "litestream $NEW + the s3lite patch ledger"
           git push origin "$TAG"
