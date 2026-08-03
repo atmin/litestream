@@ -2172,7 +2172,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.snapshotting = true
 				s.reason = info.reason
 			})
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		if err := db.writeLTXFromDB(ctx, enc, db.f, walFile, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
 				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
@@ -2285,7 +2285,12 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	return result, nil
 }
 
-func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
+// writeLTXFromDB encodes every page up to commit, taking each page from the WAL
+// when pageMap has it and from dbFile otherwise. dbFile is passed in rather than
+// read off db.f because the snapshot path runs in a goroutine that outlives its
+// caller: DB.Close nils db.f, so a snapshot still streaming would race that
+// write and then fail its reads with "invalid argument" on a closed file.
+func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, dbFile io.ReaderAt, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
 	lockPgno := ltx.LockPgno(uint32(db.pageSize))
 	data := make([]byte, db.pageSize)
 
@@ -2321,7 +2326,7 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 		db.Logger.Log(ctx, internal.LevelTrace, "encode page from database", "offset", offset, "pgno", pgno)
 
 		// Otherwise read directly from the database file.
-		if _, err := db.f.ReadAt(data, offset); err != nil {
+		if _, err := dbFile.ReadAt(data, offset); err != nil {
 			return fmt.Errorf("read database page %d: %w", pgno, err)
 		}
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
@@ -2804,8 +2809,18 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 
 	// TODO(ltx): Read database size from database header.
 
-	fi, err := db.f.Stat()
+	// Open a private handle on the database rather than sharing db.f: this
+	// reader is drained by a goroutine that can outlive DB.Close, which nils
+	// db.f. The WAL below is opened the same way, for the same reason. The
+	// snapshot's consistency comes from pos holding chkMu, not from the handle.
+	dbFile, err := os.Open(db.Path())
 	if err != nil {
+		return nil, err
+	}
+
+	fi, err := dbFile.Stat()
+	if err != nil {
+		_ = dbFile.Close()
 		return nil, err
 	}
 	commit := uint32(fi.Size() / int64(pos.pageSize))
@@ -2814,6 +2829,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 	pr, pw := io.Pipe()
 	go func() {
 		defer pos.close()
+		defer dbFile.Close()
 
 		walFile, err := os.Open(db.WALPath())
 		if err != nil {
@@ -2881,7 +2897,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			return
 		}
 
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		if err := db.writeLTXFromDB(ctx, enc, dbFile, walFile, commit, pageMap); err != nil {
 			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
 			return
 		}
