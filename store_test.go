@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -577,4 +580,109 @@ func TestStore_SetRetentionEnabled(t *testing.T) {
 			t.Fatalf("expected db.RetentionEnabled=true for %s after reset", db.Path())
 		}
 	}
+}
+
+// blockingSnapshotClient holds the first snapshot upload open until the test
+// releases it, so the test can act while a compaction is genuinely in flight.
+// The reader handed to WriteLTXFile streams pages straight out of the database
+// file, so nothing may close that file until the upload has drained.
+type blockingSnapshotClient struct {
+	litestream.ReplicaClient
+	startedOnce sync.Once
+	started     chan struct{}
+	release     chan struct{}
+	uploadErr   chan error
+}
+
+func (c *blockingSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	held := false
+	if level == litestream.SnapshotLevel {
+		c.startedOnce.Do(func() {
+			held = true
+			close(c.started)
+		})
+	}
+	if !held {
+		return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	}
+
+	<-c.release
+
+	// Delegate only now: this is the copy that pulls pages out of the database
+	// file, and it must not find the file closed underneath it.
+	info, err := c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	c.uploadErr <- err
+	return info, err
+}
+
+// TestStore_Close_StopsMonitorsBeforeClosingDBs asserts that Store.Close stops
+// its compaction monitors before it closes any database. A snapshot in flight
+// reads pages directly from DB.f and DB.Close nils that handle, so closing
+// first both races the monitor goroutine and fails the upload with
+// "read database page N: invalid argument".
+func TestStore_Close_StopsMonitorsBeforeClosingDBs(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	client := &blockingSnapshotClient{
+		ReplicaClient: db.Replica.Client,
+		started:       make(chan struct{}),
+		release:       make(chan struct{}),
+		uploadErr:     make(chan error, 1),
+	}
+	db.Replica.Client = client
+
+	levels := litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: 1 * time.Second},
+	}
+	s := litestream.NewStore([]*litestream.DB{db}, levels)
+	s.SnapshotInterval = 50 * time.Millisecond
+	if err := s.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give the snapshot monitor something to snapshot.
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	} else if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-client.started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for a snapshot upload to start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- s.Close(context.Background()) }()
+
+	// Close must block on the in-flight compaction. This wait only widens the
+	// window in which the old ordering closed the database early; with the
+	// monitors stopped first, no amount of waiting can make it fail.
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Store.Close returned while a compaction was still in flight: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	require.True(t, db.IsOpen(), "Store.Close closed the database while a compaction was still in flight")
+
+	close(client.release)
+
+	// Shutdown cancels the store's context, so the aborted compaction may well
+	// report an error — but never one from reading a database file closed
+	// underneath the reader, which is what the old ordering produced
+	// ("read database page N: invalid argument").
+	if err := <-client.uploadErr; err != nil {
+		require.NotErrorIs(t, err, os.ErrInvalid, "snapshot upload read from a closed database")
+		require.NotErrorIs(t, err, os.ErrClosed, "snapshot upload read from a closed database")
+	}
+
+	require.NoError(t, <-closeDone)
+	require.False(t, db.IsOpen(), "Store.Close returned without closing the database")
 }

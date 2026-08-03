@@ -257,6 +257,16 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
+	// Cancel and wait for background tasks *before* closing any database. A
+	// compaction in flight streams pages straight out of DB.f (writeLTXFromDB),
+	// and DB.Close nils that handle, so closing first races the monitor
+	// goroutine and fails the upload with "invalid argument" on a closed file.
+	// s.ctx is the store's own context and s.wg holds only the store's monitors,
+	// so cancelling here cannot disturb the bounded shutdown sync that
+	// db.Close(ctx) performs against the caller's context.
+	s.cancel()
+	s.wg.Wait()
+
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
 	s.mu.Unlock()
@@ -272,10 +282,6 @@ func (s *Store) Close(ctx context.Context) (err error) {
 			}
 		}
 	}
-
-	// Cancel and wait for background tasks to complete.
-	s.cancel()
-	s.wg.Wait()
 
 	return err
 }
