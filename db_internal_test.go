@@ -4434,3 +4434,89 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	default:
 	}
 }
+
+// TestDB_SnapshotReader_SurvivesDBClose asserts that a snapshot reader still
+// streaming pages is unaffected by the database file closing underneath it.
+//
+// The reader is drained by whoever uploads it — in practice a compaction
+// goroutine that outlives the call that created it — so it must hold its own
+// file handles. When it read pages off db.f instead, DB.Close nilling that field
+// was both a data race against writeLTXFromDB and an upload that died on
+// "read database page N: invalid argument".
+//
+// This closes the handle directly rather than calling DB.Close: the rest of
+// Close blocks on chkMu, which an undrained snapshot reader holds, so the full
+// shutdown path cannot reach this interleaving on demand.
+//
+// Do not "fix" this by making Store.Close stop its monitors before closing the
+// databases. That ordering looks tidier and breaks the bound callers get from
+// ShutdownSyncTimeout, because Close then waits on background work that may be
+// mid-retry against an unreachable replica. The regression only appears under
+// load, so a green local run does not clear it.
+func TestDB_SnapshotReader_SurvivesDBClose(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "db")
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	// Enough rows to span many pages, so the drain below does real page reads.
+	for i := range 200 {
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, make([]byte, 2000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Checkpoint so the pages live in the database file rather than the WAL:
+	// writeLTXFromDB takes any page it finds in the WAL from there, so without
+	// this the snapshot never reads the database file at all.
+	if err := db.checkpoint(ctx, CheckpointModeTruncate, &db.syncState); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	_, r, err := db.SnapshotReader(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Exactly what DB.Close does to the handle, and nothing else.
+	db.mu.Lock()
+	f := db.f
+	db.f = nil
+	db.mu.Unlock()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := io.Copy(io.Discard, r)
+	if err != nil {
+		t.Fatalf("draining an in-flight snapshot after the database closed: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("snapshot drained zero bytes")
+	}
+}

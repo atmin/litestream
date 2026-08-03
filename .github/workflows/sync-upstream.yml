@@ -143,14 +143,14 @@ jobs:
             "TestReplica_Restore_Follow_ResumeAheadOfSnapshot ." \
             "TestReplicaClient_WriteLTXFile_LTXTimestamp ./s3" \
             "TestReplicaClient_WriteLTXFile_LTXTimestamp ./file" \
-            "TestStore_Close_StopsMonitorsBeforeClosingDBs ." ; do
+            "TestDB_SnapshotReader_SurvivesDBClose ." ; do
             set -- $t
             if ! go test -list "^$1\$" "$2" | grep -qx "$1"; then
               echo "carried patch regressed: $1 is gone from $2" >&2
               exit 1
             fi
           done
-          go test -count=1 -run 'TestReplica_Restore_Follow|LTXTimestamp|TestStore_Close_StopsMonitors' . ./s3 ./file
+          go test -count=1 -run 'TestReplica_Restore_Follow|LTXTimestamp|TestDB_SnapshotReader_SurvivesDBClose' . ./s3 ./file
 
       - name: Push the branch and cut the tag
         id: publish
