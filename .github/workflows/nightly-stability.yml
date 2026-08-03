@@ -27,6 +27,8 @@ jobs:
   race-detector-sweep:
     name: Race Detector Sweep
     # Fork guard, as in release.yml: upstream's own automation runs only upstream.
+    # GitHub has no workflow-level `if` and `on: schedule` takes no condition, so
+    # every job below carries this same line.
     if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -42,6 +44,7 @@ jobs:
 
   ltx-behavioral-soak:
     name: LTX Behavioral Soak (${{ matrix.profile }})
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -92,6 +95,7 @@ jobs:
 
   ltx-snapshot-regression:
     name: LTX Snapshot Regression
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -125,6 +129,7 @@ jobs:
 
   minio-soak:
     name: MinIO Soak
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -171,6 +176,7 @@ jobs:
 
   replicate-restore-soak:
     name: Replicate Restore Soak
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -217,6 +223,7 @@ jobs:
 
   comprehensive-soak:
     name: Comprehensive Soak
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -264,7 +271,7 @@ jobs:
     name: Notify on Failure
     runs-on: ubuntu-latest
     needs: [race-detector-sweep, ltx-behavioral-soak, ltx-snapshot-regression, minio-soak, replicate-restore-soak, comprehensive-soak]
-    if: failure()
+    if: failure() && github.repository == 'benbjohnson/litestream'
     steps:
       - uses: actions/checkout@v4
 
