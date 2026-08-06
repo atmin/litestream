@@ -702,6 +702,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
+	progress := newRestoreProgress(opt.OnProgress, infos)
+
 	rdrs := make([]io.Reader, 0, len(infos))
 	defer func() {
 		for _, rd := range rdrs {
@@ -720,7 +722,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
+		rdrs = append(rdrs, progress.wrap(internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())))
 	}
 
 	if len(rdrs) == 0 {
@@ -808,6 +810,55 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	return nil
+}
+
+// restoreProgress reports the bytes a restore has fetched to a
+// RestoreOptions.OnProgress callback. A nil *restoreProgress is the disabled
+// case: wrap() then returns the reader untouched, so a restore without a
+// callback allocates nothing and reads through no extra layer.
+type restoreProgress struct {
+	fn      func(applied, total int64)
+	total   int64
+	applied atomic.Int64
+}
+
+// newRestoreProgress returns the accounting for a plan, or nil when the caller
+// asked for none. It reports the plan's total up front so a consumer can size a
+// progress bar before the first byte arrives.
+func newRestoreProgress(fn func(applied, total int64), infos []*ltx.FileInfo) *restoreProgress {
+	if fn == nil {
+		return nil
+	}
+	p := &restoreProgress{fn: fn}
+	for _, info := range infos {
+		p.total += info.Size
+	}
+	p.fn(0, p.total)
+	return p
+}
+
+// wrap instruments rd to report every byte it yields. It counts bytes handed to
+// the caller rather than bytes off the wire, so a resumed range read (which
+// re-opens at the current offset) is not counted twice.
+func (p *restoreProgress) wrap(rd io.ReadCloser) io.ReadCloser {
+	if p == nil {
+		return rd
+	}
+	return &restoreProgressReader{ReadCloser: rd, progress: p}
+}
+
+type restoreProgressReader struct {
+	io.ReadCloser
+	progress *restoreProgress
+}
+
+func (r *restoreProgressReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 {
+		pr := r.progress
+		pr.fn(pr.applied.Add(int64(n)), pr.total)
+	}
+	return n, err
 }
 
 // follow enters a continuous restore loop, polling for new LTX files and

@@ -3346,6 +3346,20 @@ type RestoreOptions struct {
 	// IntegrityCheck specifies the level of integrity checking after restore.
 	// Zero value (IntegrityCheckNone) skips the check for backward compatibility.
 	IntegrityCheck IntegrityCheckMode
+
+	// OnProgress, if non-nil, reports download progress of the restore plan.
+	// It is called once with (0, total) as soon as the plan is known, then
+	// after every read with the running number of bytes applied. Both counts
+	// are LTX bytes to fetch, not the size of the restored database.
+	//
+	// The callback is invoked from whichever goroutine performed the read and
+	// runs inline with it, so it must be cheap and must tolerate concurrent
+	// calls: applied is atomic, but two calls may report their samples out of
+	// order. Nil (the default) disables the accounting entirely.
+	//
+	// Only the LTX restore path reports progress; the v0.3.x format restore
+	// (RestoreV3) and follow mode's incremental apply do not.
+	OnProgress func(applied, total int64)
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.

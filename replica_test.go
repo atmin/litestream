@@ -927,6 +927,113 @@ func TestReplica_Restore_RemovesTempFileOnFailure(t *testing.T) {
 	}
 }
 
+func TestReplica_Restore_OnProgress(t *testing.T) {
+	ctx := context.Background()
+
+	// Build a replica whose restore plan spans more than one file: a snapshot plus
+	// the level-0 files committed after it. A single-file plan would not show that
+	// the byte counting accumulates across the plan.
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (v) VALUES ('one')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	c := file.NewReplicaClient(t.TempDir())
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (v) VALUES ('two')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	infos, err := litestream.CalcRestorePlan(ctx, c, 0, time.Time{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) < 2 {
+		t.Fatalf("restore plan has %d files, want a multi-file plan", len(infos))
+	}
+	var want int64
+	for _, info := range infos {
+		want += info.Size
+	}
+
+	type sample struct{ applied, total int64 }
+	var samples []sample
+
+	withProgress := filepath.Join(t.TempDir(), "restored.db")
+	opt := litestream.NewRestoreOptions()
+	opt.OutputPath = withProgress
+	opt.OnProgress = func(applied, total int64) {
+		samples = append(samples, sample{applied, total})
+	}
+	if err := r.Restore(ctx, opt); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(samples) < 2 {
+		t.Fatalf("got %d progress samples, want the plan total plus at least one read", len(samples))
+	}
+	if samples[0] != (sample{0, want}) {
+		t.Fatalf("first sample = %+v, want {0 %d} as soon as the plan is known", samples[0], want)
+	}
+	for i, s := range samples {
+		if s.total != want {
+			t.Fatalf("sample %d reports total %d, want a constant %d", i, s.total, want)
+		}
+		if i > 0 && s.applied < samples[i-1].applied {
+			t.Fatalf("sample %d regressed: %d after %d", i, s.applied, samples[i-1].applied)
+		}
+		if i > 0 && s.applied == samples[i-1].applied {
+			t.Fatalf("sample %d repeated %d bytes applied; every sample follows a read", i, s.applied)
+		}
+	}
+	if got := samples[len(samples)-1].applied; got != want {
+		t.Fatalf("final sample applied %d of %d bytes; the plan must be fully accounted for", got, want)
+	}
+
+	// A nil callback leaves the restore byte-identical: the accounting is inert,
+	// not merely quiet.
+	withoutProgress := filepath.Join(t.TempDir(), "restored.db")
+	optNil := litestream.NewRestoreOptions()
+	optNil.OutputPath = withoutProgress
+	if err := r.Restore(ctx, optNil); err != nil {
+		t.Fatal(err)
+	}
+	a, err := os.ReadFile(withProgress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(withoutProgress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatal("restore with a progress callback produced different bytes than without one")
+	}
+}
+
 func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	// This test verifies that context cancellation errors are not logged during shutdown.
 	// The fix for issue #235 ensures that context.Canceled and context.DeadlineExceeded
