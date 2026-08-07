@@ -144,14 +144,15 @@ jobs:
             "TestReplicaClient_WriteLTXFile_LTXTimestamp ./s3" \
             "TestReplicaClient_WriteLTXFile_LTXTimestamp ./file" \
             "TestDB_SnapshotReader_SurvivesDBClose ." \
-            "TestReplica_Restore_OnProgress ." ; do
+            "TestReplica_Restore_OnProgress ." \
+            "TestFsyncDir ./internal" ; do
             set -- $t
             if ! go test -list "^$1\$" "$2" | grep -qx "$1"; then
               echo "carried patch regressed: $1 is gone from $2" >&2
               exit 1
             fi
           done
-          go test -count=1 -run 'TestReplica_Restore_Follow|TestReplica_Restore_OnProgress|LTXTimestamp|TestDB_SnapshotReader_SurvivesDBClose' . ./s3 ./file
+          go test -count=1 -run 'TestReplica_Restore_Follow|TestReplica_Restore_OnProgress|LTXTimestamp|TestDB_SnapshotReader_SurvivesDBClose|TestFsyncDir' . ./s3 ./file ./internal
 
       - name: Push the branch and cut the tag
         id: publish
